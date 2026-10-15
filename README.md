@@ -1,3 +1,9 @@
+# UPDATE 10-15
+student_agent.py is currently modified from the original
+I added deep_q_learning.py
+student_agent_original.py is the original provided by prof chin
+run.py currently only looks at student_agent.py, so I am filling that file with my test code as i go
+
 # ENGS 101 Cyber RL Final Project
 
 This repository contains the student starter and a small local environment.

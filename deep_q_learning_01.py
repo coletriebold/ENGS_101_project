@@ -91,7 +91,7 @@ class SimpleAgent:
         self.training_steps += 1
 
         #update target every 100 steps
-        if self.training_steps % 100 == 0:
+        if self.training_steps % 200 == 0:
             self.target_model.load_state_dict(self.model.state_dict())
         self._log_probability = None
 
