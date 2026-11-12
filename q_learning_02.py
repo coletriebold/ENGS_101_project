@@ -34,9 +34,11 @@ class SimpleAgent:
         self._log_probability = None
         self.target_model = copy.deepcopy(self.model)
         self.training_steps = 0
+        self.next_action = None
 
     def reset(self, seed: int) -> None:
         torch.manual_seed(seed)
+        self.next_action = None
 
     def act(self, observation: Observation, training: bool) -> int:
         #returns an action based on self, it knows when you are training
@@ -56,9 +58,10 @@ class SimpleAgent:
             return int(logits.argmax().item()) #returns the highest score action. keep this because we want greedy
 
         q_values = self.model(features).masked_fill(~mask, -torch.inf)
-        if training and np.random.random() < 0.1:
-            valid_actions = torch.where(mask)[0]
-            return int(valid_actions[torch.randint(len(valid_actions), (1,), device=self.device)].item())
+        if training and self.next_action is not None:
+            action = self.next_action
+            self.next_action = None
+            return action
         return int(q_values.argmax().item())
 
     def learn(self, transition: Transition) -> None:
@@ -71,7 +74,7 @@ class SimpleAgent:
         #need to define next action for q-calc
 
 
-        next_action = 
+        next_action = next_state
         gamma = 0.99
         alpha = 0.1
         epsilon = 0.1
@@ -80,18 +83,20 @@ class SimpleAgent:
         q_predicted = q_values[action] #but this is the q-value of interest
         
         with torch.no_grad():
+
             if done:
                 q_target = reward
+                self.next_action = None
             else:
                 next_q_values = self.target_model(next_state)
                 next_q_values[~next_action_mask] = float("-inf")
                 if np.random.random() < epsilon:
-                    next_action = np.random.default_rng().integers(0,len(next_q_values))
+                    valid_actions = torch.where(next_action_mask)[0]
+                    next_action = valid_actions[torch.randint(len(valid_actions), (1,), device=self.device)].item()
                 else:
-                    next_action = np.argmax(next_q_values)
-
-
-                q_target = q_predicted + alpha*(reward + gamma*next_q_values[next_action]-q_predicted)
+                    next_action = next_q_values.argmax().item()
+                self.next_action = next_action
+                q_target = reward +  gamma*next_q_values[next_action]
         #line below essentially uses the torch loss functionality to implement difference between old q and new q
         loss = torch.nn.functional.smooth_l1_loss(q_predicted, q_target) #uses smooth_l1_loss because it is more resistance to high value errors
         ## in pseudocode, I want to calculate my q(s) for every s I visit, and then update the policy after each episode. repeat for episode
