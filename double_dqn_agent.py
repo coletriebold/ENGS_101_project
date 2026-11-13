@@ -1,230 +1,322 @@
-"""Tuned five-step prioritized dueling Double DQN.
+"""Five-step prioritized dueling Double DQN, written for readability.
 
-Standalone course submission: copy this file to student_agent.py, then run:
+To use this standalone file, copy its contents into student_agent.py and run:
     python run.py --steps 10000 --eval-episodes 3 --device cpu
 
-The same architecture, learner and hyperparameters serve Red and Blue;
-the runner trains separate weights using each role's supplied dimensions.
-Shared settings: five-step returns, dueling Double DQN, prioritized replay,
-128/128 ReLU layers, Adam lr=0.0001, gamma=0.99, batch=64, target=200,
-epsilon 1.0->0.05 over the first 65% of training, and capacity=10000.
-Learned inference state is registered in model for checkpoint serialization.
+Both roles use the same settings and architecture, with separately trained
+weights. Model dimensions and device come from the course configuration.
 """
 from collections import deque
 import copy
+from types import SimpleNamespace
+from typing import NamedTuple
+
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-# Shared across both roles. Optimized at the submission's 10,000-step budget.
-PARAMETERS = {'width': 128,
- 'lr': 0.0001,
- 'gamma': 0.99,
- 'n_step': 5,
- 'batch': 64,
- 'warmup': 64,
- 'capacity': 10000,
- 'alpha': 0.6,
- 'beta': 0.4,
- 'target': 200,
- 'tau': 0.0,
- 'decay': 0.65,
- 'eps_end': 0.05,
- 'dueling': True,
- 'masks': True,
- 'layernorm': False,
- 'activation': 'relu',
- 'quantiles': 1,
- 'reward_scale': 1.0,
- 'lr_decay': False,
- 'updates': 1,
- 'update_every': 1,
- 'weight_decay': 0.0}
+
+# These settings are shared by Red and Blue. The runner trains their weights
+# separately. Changing a setting here changes it for both roles.
+HIDDEN_UNITS = 128
+LEARNING_RATE = 0.0001
+DISCOUNT_FACTOR = 0.99
+RETURN_STEPS = 5
+BATCH_SIZE = 64
+WARMUP_TRANSITIONS = 64
+REPLAY_CAPACITY = 10_000
+PRIORITY_EXPONENT = 0.6
+INITIAL_IMPORTANCE_CORRECTION = 0.4
+TARGET_UPDATE_INTERVAL = 200
+EXPLORATION_FRACTION = 0.65
+FINAL_RANDOM_ACTION_PROBABILITY = 0.05
+MODEL_PARAMETER_LIMIT = 1_000_000
+
+
+def linear_layer_parameters(input_units, output_units):
+    """A fully connected layer learns one weight per connection and one bias
+    per output neuron. For example, Linear(3, 2) has 3*2 weights + 2 biases.
+    """
+    weights = input_units * output_units
+    biases = output_units
+    return weights + biases
+
+
+def q_network_parameters(observation_size, action_count, hidden_units):
+    """Count each layer separately so we can respect the course model limit."""
+    # The network sees both the observation and which actions are legal.
+    input_units = observation_size + action_count
+    first_hidden_layer = linear_layer_parameters(input_units, hidden_units)
+    second_hidden_layer = linear_layer_parameters(hidden_units, hidden_units)
+    state_value_head = linear_layer_parameters(hidden_units, 1)
+    action_advantage_head = linear_layer_parameters(hidden_units, action_count)
+    return (
+        first_hidden_layer
+        + second_hidden_layer
+        + state_value_head
+        + action_advantage_head
+    )
+
+
+def choose_hidden_units(config, parameter_budget):
+    """Usually use 128 neurons; shrink only if a larger environment needs it."""
+    for hidden_units in range(HIDDEN_UNITS, 0, -1):
+        parameter_count = q_network_parameters(
+            config.observation_dim, config.num_actions, hidden_units
+        )
+        if parameter_count <= parameter_budget:
+            return hidden_units
+    raise ValueError('Observation/action dimensions exceed the model budget')
 
 
 class QNetwork(nn.Module):
-    """Dueling state/action values with the valid-action mask as an input."""
+    """Estimate how valuable each legal action is.
 
-    def __init__(self, config, p, copies=1):
+    'Dueling' means learning a state value and a separate advantage for each
+    action. Combining them produces the Q value used to choose an action.
+    """
+
+    def __init__(self, config, hidden_units):
         super().__init__()
-        obs, actions = (config.observation_dim, config.num_actions)
-        self.actions, self.nq = (actions, p['quantiles'])
-        self.masks, self.dueling = (p['masks'], p['dueling'])
-        width = p['width']
-        while True:
-            input_dim = obs + (actions if self.masks else 0)
-            output_dim = (actions + int(self.dueling)) * self.nq
-            count = width * input_dim + width + width * width + width + (width + 1) * output_dim
-            if p['layernorm']:
-                count += 4 * width
-            if copies * count <= 1000000:
-                break
-            width -= 1
-            if width < 1:
-                raise ValueError('Model dimensions exceed parameter budget')
-        activation = nn.Tanh if p['activation'] == 'tanh' else nn.ReLU
-        layers = [nn.Linear(input_dim, width)]
-        if p['layernorm']:
-            layers.append(nn.LayerNorm(width))
-        layers += [activation(), nn.Linear(width, width)]
-        if p['layernorm']:
-            layers.append(nn.LayerNorm(width))
-        layers.append(activation())
-        self.body = nn.Sequential(*layers)
-        if self.dueling:
-            self.value = nn.Linear(width, self.nq)
-            self.advantage = nn.Linear(width, actions * self.nq)
-        else:
-            self.output = nn.Linear(width, actions * self.nq)
+        input_units = config.observation_dim + config.num_actions
+        self.body = nn.Sequential(
+            nn.Linear(input_units, hidden_units),
+            nn.ReLU(),
+            nn.Linear(hidden_units, hidden_units),
+            nn.ReLU(),
+        )
+        # Keep these layer names so existing checkpoints still load.
+        self.value = nn.Linear(hidden_units, 1)
+        self.advantage = nn.Linear(hidden_units, config.num_actions)
 
-    def distribution(self, x, m):
-        h = self.body(torch.cat((x, m.float()), -1) if self.masks else x)
-        if self.dueling:
-            a = self.advantage(h).reshape(*h.shape[:-1], self.actions, self.nq)
-            mean = (a * m[..., None]).sum(-2, keepdim=True) / m.sum(-1, keepdim=True).clamp_min(1)[..., None]
-            return self.value(h)[..., None, :] + a - mean
-        return self.output(h).reshape(*h.shape[:-1], self.actions, self.nq)
+    def forward(self, features, action_mask):
+        network_input = torch.cat((features, action_mask.float()), dim=-1)
+        hidden = self.body(network_input)
+        state_value = self.value(hidden)
+        advantages = self.advantage(hidden)
 
-    def forward(self, x, m):
-        return self.distribution(x, m).mean(-1)
+        # Center advantages using legal actions only. clamp_min avoids division
+        # by zero; the course interface normally guarantees a legal action.
+        legal_advantage_sum = (advantages * action_mask).sum(dim=-1, keepdim=True)
+        legal_action_count = action_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+        average_advantage = legal_advantage_sum / legal_action_count
+        return state_value + advantages - average_advantage
 
-class Replay:
-    """Bounded proportional prioritized replay with importance corrections."""
 
-    def __init__(self, config, p):
-        bytes_per = 8 * config.observation_dim + 2 * config.num_actions + 32
-        self.capacity = min(p['capacity'], max(p['batch'], 64 * 1024 * 1024 // bytes_per))
+class Experience(NamedTuple):
+    """One replay entry, with names instead of an unexplained tuple of values.
+
+    accumulated_reward covers up to RETURN_STEPS steps. future_discount is
+    gamma raised to that number of steps, or zero if the episode ended.
+    The last two fields are used only by the Monte Carlo extension.
+    """
+    features: np.ndarray
+    action_mask: np.ndarray
+    action: int
+    accumulated_reward: float
+    next_features: np.ndarray
+    next_action_mask: np.ndarray
+    future_discount: float
+    episode_return: float = 0.0
+    return_is_known: bool = False
+
+
+class ReplayBuffer:
+    """Remember experiences and revisit surprising ones more often."""
+
+    def __init__(self, config):
+        # Approximate storage for two float32 observations, two Boolean masks,
+        # and scalar fields. Bound array storage for larger hidden scenarios.
+        observation_bytes = 2 * config.observation_dim * 4
+        action_mask_bytes = 2 * config.num_actions
+        scalar_bytes = 32
+        bytes_per_experience = observation_bytes + action_mask_bytes + scalar_bytes
+        array_memory_budget = 64 * 1024 * 1024
+        memory_limited_capacity = array_memory_budget // bytes_per_experience
+        self.capacity = min(
+            REPLAY_CAPACITY, max(BATCH_SIZE, memory_limited_capacity)
+        )
         self.data = []
-        self.priorities = np.ones(self.capacity, np.float32)
-        self.cursor = 0
+        self.priorities = np.ones(self.capacity, dtype=np.float32)
+        self.cursor = 0  # Next slot to fill; wrap around when the buffer is full.
 
-    def add(self, item):
+    def add(self, experience):
         if len(self.data) < self.capacity:
-            self.data.append(item)
+            self.data.append(experience)
         else:
-            self.data[self.cursor] = item
+            self.data[self.cursor] = experience
+        # Give a new experience the highest existing priority so it gets seen.
         self.priorities[self.cursor] = self.priorities[:len(self.data)].max()
         self.cursor = (self.cursor + 1) % self.capacity
 
-    def sample(self, p, rng, progress, device):
-        n = len(self.data)
-        if p['alpha'] > 0:
-            probs = self.priorities[:n] ** p['alpha']
-            probs /= probs.sum()
-            ids = rng.choice(n, size=p['batch'], p=probs)
-            beta = p['beta'] + (1 - p['beta']) * progress
-            weights = (n * probs[ids]) ** (-beta)
-            weights /= weights.max()
-        else:
-            ids = rng.integers(n, size=p['batch'])
-            weights = np.ones(p['batch'], np.float32)
-        batch = [self.data[i] for i in ids]
-        tensors = []
-        for column in zip(*batch):
-            values = np.stack(column)
-            # Python rewards/returns become float64 in NumPy; MPS needs float32.
-            # Convert before device transfer, preserving integer actions and masks.
+    def sample(self, random_generator, training_progress, device):
+        experience_count = len(self.data)
+        probabilities = self.priorities[:experience_count] ** PRIORITY_EXPONENT
+        probabilities /= probabilities.sum()
+        indices = random_generator.choice(
+            experience_count, size=BATCH_SIZE, p=probabilities
+        )
+
+        # Sampling is deliberately biased toward high-priority experiences.
+        # These weights correct that bias, increasingly as training progresses.
+        correction_strength = INITIAL_IMPORTANCE_CORRECTION + (
+            1 - INITIAL_IMPORTANCE_CORRECTION
+        ) * training_progress
+        importance_weights = (
+            experience_count * probabilities[indices]
+        ) ** (-correction_strength)
+        importance_weights /= importance_weights.max()
+
+        sampled_experiences = [self.data[index] for index in indices]
+        batch_fields = {}
+        for field_name in Experience._fields:
+            values = np.stack([
+                getattr(experience, field_name)
+                for experience in sampled_experiences
+            ])
+            # MPS cannot accept float64. Cast before sending data to the device,
+            # while preserving integer actions and Boolean legality masks.
             if np.issubdtype(values.dtype, np.floating):
                 values = values.astype(np.float32, copy=False)
-            tensors.append(torch.as_tensor(values, device=device))
-        return (ids, torch.as_tensor(weights, dtype=torch.float32, device=device), tensors)
+            batch_fields[field_name] = torch.as_tensor(values, device=device)
 
-class DQN:
-    """One shared five-step Double DQN learner for either role."""
+        weights = torch.as_tensor(
+            importance_weights, dtype=torch.float32, device=device
+        )
+        return indices, weights, SimpleNamespace(**batch_fields)
 
-    def __init__(self, config, p):
-        self.p = p.copy()
+
+class DoubleDQNAgent:
+    """Five-step, prioritized, dueling Double DQN.
+
+    learn() has two jobs: save the latest experience, then update the network
+    from a randomly sampled batch of past experiences.
+    """
+
+    def __init__(self, config, parameter_budget=MODEL_PARAMETER_LIMIT):
         self.device = torch.device(config.device)
-        self.model = QNetwork(config, p).to(self.device)
+        hidden_units = choose_hidden_units(config, parameter_budget)
+        self.model = QNetwork(config, hidden_units).to(self.device)
+        # The target is a slowly refreshed copy used to calculate stable goals.
         self.target = copy.deepcopy(self.model).eval()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=p['lr'], weight_decay=p['weight_decay'])
-        self.rng = np.random.default_rng(config.seed)
-        self.total_steps = max(1, config.total_steps)
-        self.steps = 0
-        self.pending = deque()
-        self.replay = Replay(config, p)
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=LEARNING_RATE, weight_decay=0.0
+        )
+        self.random_generator = np.random.default_rng(config.seed)
+        self.training_budget = max(1, config.total_steps)
+        self.training_steps = 0
+        self.pending_transitions = deque()
+        self.replay = ReplayBuffer(config)
 
     def reset(self, seed):
-        self.pending.clear()
-        self.rng = np.random.default_rng(seed)
+        self.pending_transitions.clear()
+        self.random_generator = np.random.default_rng(seed)
 
-    def act(self, o, training):
-        valid = np.flatnonzero(o.action_mask)
-        if not len(valid):
+    def act(self, observation, training):
+        legal_actions = np.flatnonzero(observation.action_mask)
+        if len(legal_actions) == 0:
             raise ValueError('Observation has no valid action')
-        epsilon = 1.0 - (1.0 - self.p['eps_end']) * min(1.0, self.steps / (self.p['decay'] * self.total_steps))
-        if training and self.rng.random() < epsilon:
-            return int(self.rng.choice(valid))
+
+        # Explore heavily at first, then retain a 5% random-action probability.
+        exploration_steps = EXPLORATION_FRACTION * self.training_budget
+        exploration_progress = min(1.0, self.training_steps / exploration_steps)
+        random_action_probability = 1.0 - (
+            1.0 - FINAL_RANDOM_ACTION_PROBABILITY
+        ) * exploration_progress
+        if training and self.random_generator.random() < random_action_probability:
+            return int(self.random_generator.choice(legal_actions))
+
         with torch.no_grad():
-            x = torch.as_tensor(o.features, device=self.device)
-            m = torch.as_tensor(o.action_mask, device=self.device)
-            return int(self.model(x, m).masked_fill(~m, -torch.inf).argmax().item())
+            features = torch.as_tensor(observation.features, device=self.device)
+            action_mask = torch.as_tensor(observation.action_mask, device=self.device)
+            action_values = self.model(features, action_mask)
+            action_values = action_values.masked_fill(~action_mask, -torch.inf)
+            return int(action_values.argmax().item())
 
-    def _store(self):
-        """Store an n-step return; terminal windows may contain fewer steps."""
-        first = self.pending[0]
-        reward, discount = (0.0, 1.0)
-        for t in self.pending:
-            reward += discount * t.reward * self.p['reward_scale']
-            discount *= self.p['gamma']
-            if t.done:
-                discount = 0.0
+    def _build_experience(self):
+        """Combine up to five rewards: r0 + gamma*r1 + gamma^2*r2 + ..."""
+        first = self.pending_transitions[0]
+        last = self.pending_transitions[-1]
+        accumulated_reward = 0.0
+        future_discount = 1.0
+        for transition in self.pending_transitions:
+            accumulated_reward += future_discount * transition.reward
+            future_discount *= DISCOUNT_FACTOR
+            if transition.done:
+                future_discount = 0.0  # No future value after an episode ends.
                 break
-        last = self.pending[-1]
-        self.replay.add((first.observation.features.copy(), first.observation.action_mask.copy(), first.action, reward, last.next_observation.features.copy(), last.next_observation.action_mask.copy(), discount))
-        self.pending.popleft()
+        return Experience(
+            features=first.observation.features.copy(),
+            action_mask=first.observation.action_mask.copy(),
+            action=first.action,
+            accumulated_reward=accumulated_reward,
+            next_features=last.next_observation.features.copy(),
+            next_action_mask=last.next_observation.action_mask.copy(),
+            future_discount=future_discount,
+        )
 
-    def learn(self, t):
-        self.steps += 1
-        self.pending.append(t)
-        if len(self.pending) >= self.p['n_step']:
-            self._store()
-        if t.done:
-            while self.pending:
-                self._store()
-        if len(self.replay.data) < max(self.p['warmup'], self.p['batch']) or self.steps % self.p['update_every']:
+    def _store_oldest_transition(self):
+        self.replay.add(self._build_experience())
+        self.pending_transitions.popleft()
+
+    def _remember_transition(self, transition):
+        self.pending_transitions.append(transition)
+        if len(self.pending_transitions) >= RETURN_STEPS:
+            self._store_oldest_transition()
+        if transition.done:
+            # Save the remaining short windows too, rather than dropping the
+            # last four actions of every episode.
+            while self.pending_transitions:
+                self._store_oldest_transition()
+
+    def _calculate_targets(self, batch):
+        """Double DQN: the online model chooses; the target model evaluates."""
+        with torch.no_grad():
+            online_values = self.model(batch.next_features, batch.next_action_mask)
+            online_values = online_values.masked_fill(
+                ~batch.next_action_mask, -torch.inf
+            )
+            best_actions = online_values.argmax(dim=1, keepdim=True)
+            target_values = self.target(batch.next_features, batch.next_action_mask)
+            future_values = target_values.gather(1, best_actions).squeeze(1)
+            return (
+                batch.accumulated_reward.float()
+                + batch.future_discount.float() * future_values
+            )
+
+    def _train_from_replay(self):
+        if len(self.replay.data) < max(WARMUP_TRANSITIONS, BATCH_SIZE):
             return
-        progress = min(1.0, self.steps / self.total_steps)
-        if self.p['lr_decay']:
-            for group in self.optimizer.param_groups:
-                group['lr'] = self.p['lr'] * (1.0 - 0.9 * progress)
-        for _ in range(self.p['updates']):
-            ids, w, (x, m, a, r, nx, nm, d) = self.replay.sample(self.p, self.rng, progress, self.device)
-            if self.p['quantiles'] == 1:
-                pred = self.model(x, m).gather(1, a.long()[:, None]).squeeze(1)
-                with torch.no_grad():
-                    best = self.model(nx, nm).masked_fill(~nm, -torch.inf).argmax(1, keepdim=True)
-                    boot = self.target(nx, nm).gather(1, best).squeeze(1)
-                    target = r.float() + d.float() * boot
-                errors = F.smooth_l1_loss(pred, target, reduction='none')
-                priority = (pred - target).detach().abs()
-            else:
-                nq = self.p['quantiles']
-                pred = self.model.distribution(x, m)[torch.arange(len(a), device=self.device), a.long()]
-                with torch.no_grad():
-                    best = self.model(nx, nm).masked_fill(~nm, -torch.inf).argmax(1)
-                    boot = self.target.distribution(nx, nm)[torch.arange(len(a), device=self.device), best]
-                    target = r.float()[:, None] + d.float()[:, None] * boot
-                delta = target[:, None, :] - pred[:, :, None]
-                tau = (torch.arange(nq, device=self.device, dtype=torch.float32) + 0.5) / nq
-                huber = F.smooth_l1_loss(pred[:, :, None].expand_as(delta), target[:, None, :].expand_as(delta), reduction='none')
-                errors = ((tau[None, :, None] - (delta.detach() < 0).float()).abs() * huber).mean((1, 2))
-                priority = (target.mean(1) - pred.mean(1)).detach().abs()
-            loss = (errors * w).mean()
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
-            self.optimizer.step()
-            self.replay.priorities[ids] = priority.cpu().numpy() + 0.01 * self.p['reward_scale']
-            if self.p['tau']:
-                with torch.no_grad():
-                    for target, online in zip(self.target.parameters(), self.model.parameters()):
-                        target.lerp_(online, self.p['tau'])
-        if not self.p['tau'] and self.steps % self.p['target'] == 0:
+        progress = min(1.0, self.training_steps / self.training_budget)
+        indices, importance_weights, batch = self.replay.sample(
+            self.random_generator, progress, self.device
+        )
+        all_action_values = self.model(batch.features, batch.action_mask)
+        chosen_actions = batch.action.long()[:, None]
+        predicted_values = all_action_values.gather(1, chosen_actions).squeeze(1)
+        target_values = self._calculate_targets(batch)
+
+        # Huber loss is less sensitive to large errors than squared error.
+        errors = F.smooth_l1_loss(predicted_values, target_values, reduction='none')
+        loss = (errors * importance_weights).mean()
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+        self.optimizer.step()
+
+        # Larger prediction errors mean a transition is worth revisiting.
+        prediction_errors = (predicted_values - target_values).detach().abs()
+        self.replay.priorities[indices] = prediction_errors.cpu().numpy() + 0.01
+        if self.training_steps % TARGET_UPDATE_INTERVAL == 0:
             self.target.load_state_dict(self.model.state_dict())
+
+    def learn(self, transition):
+        self.training_steps += 1
+        self._remember_transition(transition)
+        self._train_from_replay()
 
 
 def create_agent(config):
-    """Build the same selected learner and settings for either role."""
-    return DQN(config, PARAMETERS)
+    """Course entry point: the same learner supports either role."""
+    return DoubleDQNAgent(config)
